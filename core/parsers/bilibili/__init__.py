@@ -44,9 +44,10 @@ class BilibiliParser(BaseParser):
         self.video_quality = getattr(
             VideoQuality, str(self.mycfg.video_quality).upper(), VideoQuality._720P
         )
-        self.video_codecs = []
-        for c in self.mycfg.video_codec_list or [VideoCodecs.AVC]:
-            self.video_codecs.append(c)
+        self.video_codecs = [
+            getattr(VideoCodecs, str(c).upper(), VideoCodecs.AVC)
+            for c in (self.mycfg.video_codec_list or ["AVC"])
+        ]
         self.login = BilibiliLogin(config)
 
     @handle("b23.tv", r"b23\.tv/[A-Za-z\d\._?%&+\-=/#]+")
