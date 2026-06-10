@@ -1,6 +1,7 @@
 import asyncio
+from pathlib import Path
 from re import Match
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from bilibili_api import request_settings, select_client
 from bilibili_api.opus import Opus
@@ -10,6 +11,7 @@ from msgspec import convert
 from astrbot.api import logger
 
 from ...config import PluginConfig
+from ...cookie import CookieJar
 from ...data import ImageContent, MediaContent, Platform
 from ...exception import DownloadException, DurationLimitException
 from ..base import (
@@ -44,10 +46,16 @@ class BilibiliParser(BaseParser):
         self.video_quality = getattr(
             VideoQuality, str(self.mycfg.video_quality).upper(), VideoQuality._720P
         )
+        video_codec_list = getattr(self.mycfg, "video_codec_list", None) or getattr(
+            self.mycfg, "video_codecs", None
+        )
+        if isinstance(video_codec_list, str):
+            video_codec_list = [video_codec_list]
         self.video_codecs = [
             getattr(VideoCodecs, str(c).upper(), VideoCodecs.AVC)
-            for c in (self.mycfg.video_codec_list or ["AVC"])
+            for c in (video_codec_list or ["AVC"])
         ]
+        self.cookiejar = CookieJar(config, self.mycfg, domain="bilibili.com")
         self.login = BilibiliLogin(config)
 
     @handle("b23.tv", r"b23\.tv/[A-Za-z\d\._?%&+\-=/#]+")
@@ -167,33 +175,10 @@ class BilibiliParser(BaseParser):
         url = f"https://bilibili.com/{video_info.bvid}"
         url += f"?p={page_info.index + 1}" if page_info.index > 0 else ""
 
-        # 视频下载 task
-        async def download_video():
-            output_path = self.cfg.cache_dir / f"{video_info.bvid}-{page_num}.mp4"
-            if output_path.exists():
-                return output_path
-            v_url, a_url = await self.extract_download_urls(
-                video=video, page_index=page_info.index
-            )
-            if page_info.duration > self.cfg.max_duration:
-                raise DurationLimitException
-            if a_url is not None:
-                return await self.downloader.download_av_and_merge(
-                    v_url,
-                    a_url,
-                    output_path=output_path,
-                    headers=self.headers,
-                    proxy=self.proxy,
-                )
-            else:
-                return await self.downloader.streamd(
-                    v_url,
-                    file_name=output_path.name,
-                    headers=self.headers,
-                    proxy=self.proxy,
-                )
-
-        video_task = asyncio.create_task(download_video())
+        output_path = self.cfg.cache_dir / f"{video_info.bvid}-{page_num}.mp4"
+        video_task = asyncio.create_task(
+            self._download_video(video, page_info.index, output_path, page_info.duration)
+        )
         video_content = self.create_video_content(
             video_task,
             page_info.cover,
@@ -209,6 +194,63 @@ class BilibiliParser(BaseParser):
             contents=[video_content],
             extra={"info": ai_summary},
         )
+
+    async def _download_video(
+        self,
+        video: Video,
+        page_index: int,
+        output_path: Path,
+        duration: float,
+    ) -> Path:
+        try:
+            if output_path.exists():
+                return output_path
+
+            v_url, a_url = await self.extract_download_urls(
+                video=video, page_index=page_index
+            )
+            if duration > self.cfg.max_duration:
+                raise DurationLimitException
+            headers = await self._download_headers()
+
+            if a_url is not None:
+                return await self.downloader.download_av_and_merge(
+                    v_url,
+                    a_url,
+                    output_path=output_path,
+                    headers=headers,
+                    proxy=self.proxy,
+                )
+
+            return await self.downloader.streamd(
+                v_url,
+                file_name=output_path.name,
+                headers=headers,
+                proxy=self.proxy,
+            )
+        except DownloadException:
+            raise
+        except Exception as e:
+            logger.warning(f"B站视频下载失败: {e}")
+            raise DownloadException("B站视频下载失败") from e
+
+    async def _download_headers(self) -> dict[str, str]:
+        headers = dict(self.headers)
+        cookie_header = self.cookiejar.get_cookie_header(domain="bilibili.com")
+
+        if not cookie_header:
+            credential = await self.login.credential
+            if credential is not None:
+                cookie_header = "; ".join(
+                    f"{name}={value}"
+                    for name, value in credential.get_cookies().items()
+                    if value is not None
+                )
+
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+
+        return headers
 
     async def parse_dynamic(self, dynamic_id: int):
         """解析动态信息
@@ -412,27 +454,114 @@ class BilibiliParser(BaseParser):
         if video is None:
             video = await self._get_video(bvid=bvid, avid=avid)
 
-        # 获取下载数据
-        download_url_data = await video.get_download_url(page_index=page_index)
-        detecter = VideoDownloadURLDataDetecter(download_url_data)
-        streams = detecter.detect_best_streams(
-            video_max_quality=self.video_quality,
-            codecs=self.video_codecs,
-            no_dolby_video=True,
-            no_hdr=True,
-        )
-        video_stream = streams[0]
+        try:
+            download_url_data = await video.get_download_url(page_index=page_index)
+            detecter = VideoDownloadURLDataDetecter(download_url_data)
+            streams = self._detect_best_streams_compat(
+                detecter,
+                VideoStreamDownloadURL,
+                AudioStreamDownloadURL,
+            )
+        except DownloadException:
+            raise
+        except Exception as e:
+            raise DownloadException("B站视频流解析失败") from e
+
+        video_stream = streams[0] if streams else None
         if not isinstance(video_stream, VideoStreamDownloadURL):
             raise DownloadException("未找到可下载的视频流")
         logger.debug(
             f"视频流质量: {video_stream.video_quality.name}, 编码: {video_stream.video_codecs}"
         )
 
-        audio_stream = streams[1]
+        audio_stream = streams[1] if len(streams) > 1 else None
         if not isinstance(audio_stream, AudioStreamDownloadURL):
             return video_stream.url, None
         logger.debug(f"音频流质量: {audio_stream.audio_quality.name}")
         return video_stream.url, audio_stream.url
+
+    def _detect_best_streams_compat(
+        self,
+        detecter,
+        video_stream_cls: type,
+        audio_stream_cls: type,
+    ) -> list[Any]:
+        kwargs = {
+            "video_max_quality": self.video_quality,
+            "codecs": self.video_codecs,
+            "no_dolby_video": True,
+            "no_hdr": True,
+        }
+
+        try:
+            return detecter.detect_best_streams(**kwargs)
+        except AttributeError as e:
+            logger.warning(f"B站视频流选择触发兼容兜底: {e}")
+
+        streams = detecter.detect(**kwargs)
+        return self._select_best_streams_compat(
+            streams,
+            video_stream_cls,
+            audio_stream_cls,
+        )
+
+    def _select_best_streams_compat(
+        self,
+        streams: list[Any],
+        video_stream_cls: type,
+        audio_stream_cls: type,
+    ) -> list[Any]:
+        video_streams = [
+            stream
+            for stream in streams
+            if isinstance(stream, video_stream_cls)
+            and getattr(stream, "url", None)
+            and getattr(stream, "video_quality", None) is not None
+        ]
+        audio_streams = [
+            stream
+            for stream in streams
+            if isinstance(stream, audio_stream_cls) and getattr(stream, "url", None)
+        ]
+
+        video_stream = (
+            max(video_streams, key=self._video_stream_sort_key)
+            if video_streams
+            else None
+        )
+        audio_stream = (
+            max(audio_streams, key=self._audio_stream_sort_key)
+            if audio_streams
+            else None
+        )
+        return [video_stream, audio_stream]
+
+    def _video_stream_sort_key(self, stream) -> tuple[int, int]:
+        return (
+            self._enum_value(getattr(stream, "video_quality", None)),
+            -self._codec_rank(getattr(stream, "video_codecs", None)),
+        )
+
+    @staticmethod
+    def _audio_stream_sort_key(stream) -> int:
+        return BilibiliParser._enum_value(getattr(stream, "audio_quality", None))
+
+    def _codec_rank(self, codec) -> int:
+        if codec is None:
+            return len(self.video_codecs)
+
+        codec_value = self._enum_value(codec, codec)
+        for index, preferred in enumerate(self.video_codecs):
+            if codec_value == self._enum_value(preferred, preferred):
+                return index
+
+        return len(self.video_codecs) + 1
+
+    @staticmethod
+    def _enum_value(value, default: Any = -1):
+        if value is None:
+            return default
+        return getattr(value, "value", value)
 
 
 

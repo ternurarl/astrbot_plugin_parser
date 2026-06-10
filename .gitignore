@@ -1,2 +1,6 @@
 __pycache__/
 core/test/
+.agents/
+.pytest_cache/
+.pytest_tmp/
+skills-lock.json
