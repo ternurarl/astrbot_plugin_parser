@@ -29,6 +29,7 @@ from .data import (
 from .exception import (
     DownloadException,
     DownloadLimitException,
+    DurationLimitException,
     SizeLimitException,
     ZeroSizeException,
 )
@@ -183,6 +184,9 @@ class MessageSender:
         for cont in plan["heavy"]:
             try:
                 path: Path = await cont.get_path()
+            except DurationLimitException:
+                segs.append(Plain("此项媒体超过时长限制"))
+                continue
             except SizeLimitException:
                 segs.append(Plain("此项媒体超过大小限制"))
                 continue
